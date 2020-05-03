@@ -1,16 +1,19 @@
 [package]
 name = "bottle"
-version = "0.1.0"
-authors = ["Timothée Haudebourg <timothee.haudebourg@irisa.fr>"]
+version = "1.0.0"
+repository = "https://github.com/timothee-haudebourg/bottle"
+authors = ["Timothée Haudebourg <author@haudebourg.net>"]
+license = "MIT/Apache-2.0"
+categories = ["asynchronous"]
+keywords = ["concurrent", "thread", "async", "actor", "signals"]
+description = "Actor model framework for Rust."
 edition = "2018"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [dependencies]
-futures = "*"
-crossbeam-queue = "*"
-parking_lot = "*"
-static_assertions = "1.1.0"
+futures = "0.3"
+crossbeam-queue = "0.2"
+parking_lot = "0.10"
+static_assertions = "1.1"
 
 [dev-dependencies]
-async-std = { version = "*", features = ["attributes"] }
+async-std = { version = "1.5", features = ["attributes"] }
