@@ -1,6 +1,6 @@
 [package]
 name = "bottle"
-version = "1.0.0"
+version = "1.0.0-alpha"
 repository = "https://github.com/timothee-haudebourg/bottle"
 authors = ["Timothée Haudebourg <author@haudebourg.net>"]
 license = "MIT/Apache-2.0"
