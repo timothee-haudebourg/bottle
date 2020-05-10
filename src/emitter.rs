@@ -16,7 +16,7 @@ impl<E: Event> Event for SubscriptionEvent<E> {
 }
 
 impl<E: Event, T: ?Sized + Emitter<E>> Handler<SubscriptionEvent<E>> for T {
-	fn handle(mut self: Receiver<Self>, event: SubscriptionEvent<E>) -> Output<bool> {
+	fn handle<'a>(mut self: Receiver<'a, Self>, event: SubscriptionEvent<E>) -> Output<'a, bool> {
 		match event {
 			SubscriptionEvent::Subscribe(remote) => Output::Now(self.subscribe(remote)),
 			SubscriptionEvent::Unsubscribe(remote) => Output::Now(self.unsubscribe(remote))

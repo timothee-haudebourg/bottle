@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::future::Future as StdFuture;
 use std::task::{Waker, Context, Poll};
 use std::pin::Pin;
 use crossbeam_queue::SegQueue as AtomicQueue;
@@ -62,9 +63,10 @@ pub struct EventQueueRef {
 
 impl EventQueueRef {
 	/// Push an event to the queue.
-	pub fn push<E: 'static + Event, T: 'static + ?Sized + Handler<E>>(&self, receiver: Remote<T>, event: E) -> Future<E::Response> {
-		let future = Future::new();
-		self.queue.push(Box::new(ToReceive::new(receiver, event, Arc::downgrade(&future.state))));
+	pub fn push<E: 'static + Event, T: 'static + ?Sized + Handler<E>>(&self, receiver: Remote<T>, event: E) -> Future<T, E::Response> {
+		let pending = Box::new(ToReceive::new(receiver, event));
+		let future = Future::new(pending.state().clone());
+		self.queue.push(pending);
 		future
 	}
 
@@ -103,7 +105,8 @@ impl EventQueue {
 
 	pub fn process(self) -> EventQueueProcessor {
 		EventQueueProcessor {
-			queue: self.queue
+			queue: self.queue,
+			pending_futures: Vec::new()
 		}
 	}
 }
@@ -117,7 +120,8 @@ impl EventQueue {
 /// Since every actor attached to the processor's queue must be run in the same thread and never
 /// move (which is the basis of the actor model), this type does not implement `Send` nor `Sync`.
 pub struct EventQueueProcessor {
-	queue: Arc<Queue<Box<dyn Pending>>>
+	queue: Arc<Queue<Box<dyn Pending>>>,
+	pending_futures: Vec<Pin<Box<dyn StdFuture<Output = ()>>>>
 }
 
 impl !Send for EventQueueProcessor {}
@@ -135,11 +139,47 @@ impl EventQueueProcessor {
 impl futures::future::Future for EventQueueProcessor {
 	type Output = ();
 
-	fn poll(self: Pin<&mut Self>, ctx: &mut Context) -> Poll<()> {
+	fn poll(mut self: Pin<&mut Self>, ctx: &mut Context) -> Poll<()> {
+		retain_mut(&mut self.pending_futures, |future| {
+			match future.as_mut().poll(ctx) {
+				Poll::Pending => true,
+				_ => false
+			}
+		});
+
 		if let Some(pending) = self.queue.pop(ctx.waker().clone()) {
-			pending.process()
+			if let Some(mut future) = pending.post() {
+				match future.as_mut().poll(ctx) {
+					Poll::Pending => {
+						self.pending_futures.push(future);
+					},
+					_ => ()
+				}
+			}
 		}
 
 		Poll::Pending
+	}
+}
+
+fn retain_mut<T, F>(vec: &mut Vec<T>, mut f: F)
+where
+	F: FnMut(&mut T) -> bool,
+{
+	let len = vec.len();
+	let mut del = 0;
+	{
+		let v = &mut **vec;
+
+		for i in 0..len {
+			if !f(&mut v[i]) {
+				del += 1;
+			} else if del > 0 {
+				v.swap(i - del, i);
+			}
+		}
+	}
+	if del > 0 {
+		vec.truncate(len - del);
 	}
 }

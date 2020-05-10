@@ -4,6 +4,7 @@ use std::sync::{Arc, Weak};
 use std::cell::RefCell;
 use std::mem::MaybeUninit;
 use std::hash::{Hash, Hasher};
+use std::collections::VecDeque;
 use crate::{
 	Output,
 	Receiver,
@@ -11,20 +12,43 @@ use crate::{
 	EventQueueRef,
 	Handler,
 	Future,
+	future::LocalFuture,
 	Local,
 	ThreadLocal,
 	Emitter,
-	SubscriptionEvent
+	SubscriptionEvent,
+	Pending,
+	pending
 };
 
+pub struct Actor<T: ?Sized> {
+	// pub(crate) inbox: VecDeque<(Box<dyn Pending>, Arc<Mutex<pending::FutureState>>)>,
+	pub(crate) inbox: VecDeque<Box<dyn Pending>>,
+	pub(crate) is_busy: bool,
+	pub(crate) data: T
+}
+
+impl<T: ?Sized> Actor<T> {
+	/// Must be called from the actor thread.
+	pub(crate) unsafe fn post<E: Event>(&mut self, event: E) -> Output<E::Response> where T: 'static + Handler<E> {
+		let local = Receiver::new(&mut self.data);
+		local.handle(event)
+	}
+
+	pub(crate) unsafe fn init(&mut self, mut value: T) where T: Sized {
+		std::mem::swap(&mut self.data, &mut value);
+		std::mem::forget(value)
+	}
+}
+
 pub(crate) struct Inner<T: ?Sized> {
-	pub(crate) queue: EventQueueRef,
-	pub(crate) actor: RefCell<T>
+	pub(crate) queue: EventQueueRef, // + 8
+	pub(crate) actor: RefCell<Actor<T>>
 }
 
 /// A pointer to a remote actor.
 pub struct Remote<T: ?Sized> {
-	pub(crate) inner: Arc<Inner<T>>
+	pub(crate) inner: Arc<Inner<T>> // + 8
 }
 
 impl<T: ?Sized + Unsize<U>, U: ?Sized> CoerceUnsized<Remote<U>> for Remote<T> {}
@@ -39,7 +63,9 @@ impl<T: ?Sized> Remote<T> {
 			let remote = Remote {
 				inner: Arc::new(Inner {
 					queue: queue,
-					actor: RefCell::new(
+					actor: RefCell::new(Actor {
+						inbox: VecDeque::new(),
+						is_busy: false,
 						// Why it is safe.
 						// [1] We know the value won't be touched before initialization: the first
 						// message received by the remote pointer is the initialization request.
@@ -48,8 +74,8 @@ impl<T: ?Sized> Remote<T> {
 						// actor is unsafe.
 						// [2] We know the actor won't be dropped before initialization: the
 						// initialization request message holds a copy of the remote.
-						MaybeUninit::uninit().assume_init()
-					)
+						data: MaybeUninit::uninit().assume_init()
+					})
 				})
 			};
 
@@ -62,13 +88,20 @@ impl<T: ?Sized> Remote<T> {
 		Remote {
 			inner: Arc::new(Inner {
 				queue: queue,
-				actor: RefCell::new(value)
+				actor: RefCell::new(Actor {
+					inbox: VecDeque::new(),
+					is_busy: false,
+					data: value
+				})
 			})
 		}
 	}
 
 	pub fn as_ptr(&self) -> *const T {
-		self.inner.actor.as_ptr()
+		let actor_ptr = self.inner.actor.as_ptr();
+		unsafe {
+			&(*actor_ptr).data
+		}
 	}
 
 	pub(crate) fn from_inner(inner: Arc<Inner<T>>) -> Remote<T> {
@@ -100,23 +133,56 @@ impl<T: ?Sized> Remote<T> {
 		}
 	}
 
-	/// Must be called from the actor thread.
-	pub unsafe fn post<E: Event>(&self, event: E) -> Output<E::Response> where T: 'static + Handler<E> {
-		let mut actor = self.inner.actor.borrow_mut();
-		let local = Receiver::new(&mut *actor);
-		local.handle(event)
-	}
-
-	pub(crate) unsafe fn init(&self, mut value: T) where T: Sized {
-		std::mem::swap(&mut *self.inner.actor.as_ptr(), &mut value);
-		std::mem::forget(value)
-	}
-
-	pub fn send<E: Event>(&self, event: E) -> Future<E::Response> where E: 'static, T: 'static + Handler<E> {
+	pub fn send<E: Event>(&self, event: E) -> Future<T, E::Response> where E: 'static, T: 'static + Handler<E> {
 		self.inner.queue.push(self.clone(), event)
 	}
 
-	pub fn subscribe<E: Event>(&self, subscriber: Remote<dyn Handler<E>>) -> Future<bool> where E: 'static, T: 'static + Emitter<E> {
+	pub(crate) fn post<E: Event>(&self, pending: Box<pending::ToReceive<E, T>>) -> LocalFuture<T, E::Response> where E: 'static, T: 'static + Handler<E> {
+		let future_state = pending.state().clone();
+
+		{
+			let mut actor = self.inner.actor.borrow_mut();
+			if actor.is_busy || !actor.inbox.is_empty() {
+				actor.inbox.push_front(pending);
+				return LocalFuture::new(future_state)
+			}
+		}
+
+		pending.process();
+		LocalFuture::new(future_state)
+	}
+
+	pub(crate) fn post_any(&self, pending: Box<dyn Pending>) {
+		{
+			let mut actor = self.inner.actor.borrow_mut();
+			if actor.is_busy || !actor.inbox.is_empty() {
+				actor.inbox.push_front(pending);
+				return
+			}
+		}
+
+		pending.process()
+	}
+
+	/// Restart the remote events execution.
+	///
+	/// This must be called from the actor's thread,
+	/// and only when no futures bound to this actor are executing.
+	pub(crate) unsafe fn restart(&self) {
+		// check if there is any pending events.
+		let pending = {
+			let mut actor = self.inner.actor.borrow_mut();
+			actor.is_busy = false;
+			actor.inbox.pop_back()
+		};
+
+		// if there is, process it since the actor is not busy anymore.
+		if let Some(pending) = pending {
+			pending.process()
+		}
+	}
+
+	pub fn subscribe<E: Event>(&self, subscriber: Remote<dyn Handler<E>>) -> Future<T, bool> where E: 'static, T: 'static + Emitter<E> {
 		self.send(SubscriptionEvent::Subscribe(subscriber))
 	}
 
@@ -171,7 +237,7 @@ impl<T: ?Sized> WeakRemote<T> {
 		}
 	}
 
-	pub fn send<E: Event>(&self, event: E) -> Option<Future<E::Response>> where E: 'static, T: 'static + Handler<E> {
+	pub fn send<E: Event>(&self, event: E) -> Option<Future<T, E::Response>> where E: 'static, T: 'static + Handler<E> {
 		if let Some(remote) = self.upgrade() {
 			Some(remote.send(event))
 		} else {

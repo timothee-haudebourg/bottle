@@ -1,7 +1,6 @@
 use std::marker::Unsize;
-use std::ops::{Deref, DispatchFromDyn, CoerceUnsized};
+use std::ops::{DispatchFromDyn, CoerceUnsized};
 use std::sync::Arc;
-use std::cell::RefCell;
 use crate::{Remote, Event, Handler, Future, Inner, ThreadLocal, EventQueueRef};
 
 /// A reference to a local actor.
@@ -28,14 +27,6 @@ impl<T: ?Sized> Clone for Local<T> {
 	}
 }
 
-impl<T> Deref for Local<T> {
-	type Target = RefCell<T>;
-
-	fn deref(&self) -> &RefCell<T> {
-		&self.inner.actor
-	}
-}
-
 impl<T: ?Sized> Local<T> {
 	pub(crate) fn from_inner(inner: Arc<Inner<T>>) -> Local<T> {
 		Local {
@@ -47,7 +38,7 @@ impl<T: ?Sized> Local<T> {
 		Remote::from_inner(self.inner.clone())
 	}
 
-	pub fn send<E: Event>(&self, event: E) -> Future<E::Response> where E: 'static, T: 'static + Handler<E> {
+	pub fn send<E: Event>(&self, event: E) -> Future<T, E::Response> where E: 'static, T: 'static + Handler<E> {
 		self.inner.queue.push(self.as_remote(), event)
 	}
 }
